@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -6,17 +7,42 @@
 #include <assert.h>
 
 enum {
+    /* 'ftyp' File type compatibility—identifies the file type and 
+     * differentiates it from similar file types, such as MPEG-4 files
+     * and JPEG-2000 files. */
     Type_ftyp = 0x66747970,
+
+    /* 'mdat' Movie sample data—media samples such as video frames and
+     * groups of audio samples. Usually this data can be interpreted 
+     * only by using the movie resource. */
     Type_mdat = 0x6d646174,
+
+    /* 'moov' Movie resource metadata about the movie (number and type 
+     * of tracks, location of sample data, and so on). Describes where
+     * the movie data can be found and how to interpret it. */
+    Type_moov = 0x6D6F6F76,
+
+    /* 'free' Unused space available in file.*/
+    Type_free = 0x72666565,
+
+    /* 'skip' Unused space available in file. */
+    Type_skip = 0x6b737069,
+
+    /* 'wide' Reserved space—can be overwritten by an extended size field
+     * if the following atom exceeds 2^32 bytes, without displacing the
+     * contents of the following atom. */
     Type_mvhd = 0x6d766864,
+
+    /* 'pnot' Reference to movie preview data. */
+    Type_pnott = 6e70 746f,
+
     Type_dcmd = 0x64636d64,
     Type_tkhd = 0x746b6864,
     Type_elst = 0x656c7374,
     Type_mdhd = 0x6d646864, 
-    Type_moov = 0x6D6F6F76,
     Type_trak = 0x7472616B,
     Type_wide = 0x77696465,
-};
+}; 
 
 struct qtatom {
     uint64_t file_offset;
@@ -51,11 +77,34 @@ struct mp4_state {
     };
 };
 
+static const char *name_from_type(unsigned type)
+{
+    static char buf[5];
+    size_t i;
+    buf[0] = (type >> 24) & 0xFF;
+    buf[1] = (type >> 16) & 0xFF;
+    buf[2] = (type >>  8) & 0xFF;
+    buf[3] = (type >>  0) & 0xFF;
+    buf[4] = '\0';
+    for (i=0; i<4; i++) {
+        if (!isprint(buf[i]))
+            buf[i] = '*';
+    }
+    return buf;
+}
+
 
 size_t mp4_parse_ftyp(struct mp4_state *s, struct ftyp *ftyp, const unsigned char *buf, 
     size_t offset, size_t max, int is_final)
 {
     unsigned state = s->inner_state;
+
+    if (s->inner_state == 0) {
+        printf("0x%08x 0x%08x \"%s\" ", 
+                    (unsigned)s->atom.file_offset,
+                    (unsigned)s->atom.length,
+                    name_from_type(s->atom.type));
+    }
 
     while (offset < max) {
         unsigned char c = buf[offset++];
@@ -118,7 +167,7 @@ size_t mp4_parse_ftyp(struct mp4_state *s, struct ftyp *ftyp, const unsigned cha
     }
 
     if (is_final)
-        printf("-\n");
+        printf("\n");
     s->inner_state = state;
     return offset;
 }
@@ -184,34 +233,22 @@ size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset,
     return offset;
 }
 
-static const char *name_from_type(unsigned type)
-{
-    static char buf[5];
-    size_t i;
-    buf[0] = (type >> 24) & 0xFF;
-    buf[1] = (type >> 16) & 0xFF;
-    buf[2] = (type >>  8) & 0xFF;
-    buf[3] = (type >>  0) & 0xFF;
-    buf[4] = '\0';
-    for (i=0; i<4; i++) {
-        if (!isprint(buf[i]))
-            buf[i] = '*';
-    }
-    return buf;
-}
 
 /**
  * The default parser
  */
 size_t mp4_parse_unknown(struct mp4_state *s, struct unknown *unknown, const unsigned char *buf, size_t offset, size_t max, int is_final)
 {
-    while (offset < max) {
-        switch (s->inner_state) {
-            case 0:
-                printf("0x%08x 0x%08x \"%s\" ", 
+    if (s->inner_state == 0) {
+        printf("0x%08x 0x%08x \"%s\" ", 
                     (unsigned)s->atom.file_offset,
                     (unsigned)s->atom.length,
                     name_from_type(s->atom.type));
+    }
+
+    while (offset < max) {
+        switch (s->inner_state) {
+            case 0:
                 s->inner_state++;
                 unknown->bytes_printed = 0;
                 break;
@@ -224,7 +261,7 @@ size_t mp4_parse_unknown(struct mp4_state *s, struct unknown *unknown, const uns
     }
 
     if (is_final)
-        printf("+\n");
+        printf("\n");
     return offset;
 }
 
@@ -248,7 +285,7 @@ void mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, siz
          * atom or the current remaining bytes in this buffer. */
         sub_length = max - offset;
         if (sub_length > s->atom.remaining)
-            sub_length = s->atom.remaining;
+            sub_length = (size_t)s->atom.remaining;
         is_final = (sub_length == s->atom.remaining);
 
         /* Parse the inner section */
@@ -275,17 +312,11 @@ void mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, siz
 }
 
 
-int main(int argc, char *argv[])
+int parse_file(const char *filename)
 {
-    const char *filename = argv[1];
     FILE *fp;
     struct mp4_state s = {0};
     uint64_t total_read = 0;
-
-    if (argc <= 0) {
-        printf("Usage:\n mp4-dev <filename>\n");
-        return 1;
-    }
 
     fp = fopen(filename, "rb");
     if (fp == NULL) {
@@ -305,7 +336,22 @@ int main(int argc, char *argv[])
         total_read += bytes_read;
     }
 
-    printf("=\n");
     printf("total = %llu\n", (unsigned long long)total_read);
+
+    fclose(fp);
+}
+
+int main(int argc, char *argv[])
+{
+    int i;
+
+    if (argc <= 0) {
+        printf("Usage:\n mp4-dev <filename>\n");
+        return 1;
+    }
+
+    for (i=1; i<argc; i++) {
+        parse_file(argv[i]);
+    }
     return 0;
 }
