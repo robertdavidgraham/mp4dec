@@ -1,97 +1,16 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include "qtatom.h"
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <assert.h>
-
-enum {
-    /* 'ftyp' File type compatibility—identifies the file type and 
-     * differentiates it from similar file types, such as MPEG-4 files
-     * and JPEG-2000 files. */
-    Type_ftyp = 0x66747970,
-
-    /* 'mdat' Movie sample data—media samples such as video frames and
-     * groups of audio samples. Usually this data can be interpreted 
-     * only by using the movie resource. */
-    Type_mdat = 0x6d646174,
-
-    /* 'moov' Movie resource metadata about the movie (number and type 
-     * of tracks, location of sample data, and so on). Describes where
-     * the movie data can be found and how to interpret it. */
-    Type_moov = 0x6D6F6F76,
-
-    /* 'free' Unused space available in file.*/
-    Type_free = 0x72666565,
-
-    /* 'skip' Unused space available in file. */
-    Type_skip = 0x6b737069,
-
-    /* 'wide' Reserved space—can be overwritten by an extended size field
-     * if the following atom exceeds 2^32 bytes, without displacing the
-     * contents of the following atom. */
-    Type_mvhd = 0x6d766864,
-
-    /* 'pnot' Reference to movie preview data. */
-    Type_pnott = 6e70 746f,
-
-    Type_dcmd = 0x64636d64,
-    Type_tkhd = 0x746b6864,
-    Type_elst = 0x656c7374,
-    Type_mdhd = 0x6d646864, 
-    Type_trak = 0x7472616B,
-    Type_wide = 0x77696465,
-}; 
-
-struct qtatom {
-    uint64_t file_offset;
-    uint64_t length;
-    uint64_t remaining;
-    uint32_t type;
-    uint8_t state;
-};
-
-struct ftyp
-{
-    unsigned subtype;
-    unsigned version;
-    unsigned compat;
-};
-
-struct unknown
-{
-    unsigned bytes_printed;
-};
+#include <stdlib.h>
 
 
-struct mp4_state {
-    unsigned x;
-    struct qtatom atom;
 
 
-    unsigned inner_state;
-    union {
-        struct ftyp ftyp;
-        struct unknown unknown;
-    };
-};
-
-static const char *name_from_type(unsigned type)
-{
-    static char buf[5];
-    size_t i;
-    buf[0] = (type >> 24) & 0xFF;
-    buf[1] = (type >> 16) & 0xFF;
-    buf[2] = (type >>  8) & 0xFF;
-    buf[3] = (type >>  0) & 0xFF;
-    buf[4] = '\0';
-    for (i=0; i<4; i++) {
-        if (!isprint(buf[i]))
-            buf[i] = '*';
-    }
-    return buf;
-}
 
 
 size_t mp4_parse_ftyp(struct mp4_state *s, struct ftyp *ftyp, const unsigned char *buf, 
@@ -100,10 +19,7 @@ size_t mp4_parse_ftyp(struct mp4_state *s, struct ftyp *ftyp, const unsigned cha
     unsigned state = s->inner_state;
 
     if (s->inner_state == 0) {
-        printf("0x%08x 0x%08x \"%s\" ", 
-                    (unsigned)s->atom.file_offset,
-                    (unsigned)s->atom.length,
-                    name_from_type(s->atom.type));
+        qtatom_debug_prolog(&s->atom);
     }
 
     while (offset < max) {
@@ -166,12 +82,33 @@ size_t mp4_parse_ftyp(struct mp4_state *s, struct ftyp *ftyp, const unsigned cha
         }        
     }
 
-    if (is_final)
-        printf("\n");
+    if (is_final) {
+        qtatom_debug_epilog(&s->atom);
+    }
     s->inner_state = state;
     return offset;
 }
 
+size_t mp4_parse_container(struct mp4_state *s, struct container *moov, const unsigned char *buf, 
+    size_t offset, size_t max, int is_final)
+{
+
+    if (s->inner_state == 0) {
+        qtatom_debug_prolog(&s->atom);
+        qtatom_debug_epilog(&s->atom);
+        moov->subitem = malloc(sizeof(moov->subitem[0]));
+        memset(moov->subitem, 0, sizeof(moov->subitem[0]));
+        moov->subitem->atom.indent = s->atom.indent + 1;
+        moov->subitem->atom.file_offset = s->atom.file_offset + s->atom.header_length;
+        s->inner_state++;
+    }
+
+    mp4_parse(moov->subitem, buf, offset, max);
+    
+    if (is_final)
+        free(moov->subitem);
+    return offset;
+}
 
 size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset, size_t max)
 {
@@ -179,6 +116,7 @@ size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset,
 
         switch (s->state) {
         case 0: case 1: case 2: case 3:
+            s->header_length = 0;
             s->length <<= 8;
             s->length |= buf[offset++];
             s->state++;
@@ -200,10 +138,13 @@ size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset,
                     s->state = 9;
                 } else {
                     s->remaining = s->length - 8;
+                    s->header_length = 8;
                 }
             }
             break;
         case 8:
+            /* This is where parsing ends for the header */
+            assert(s->header_length == 8 || s->header_length == 16);
             return offset;
         case 9: /* error */
             offset = max;
@@ -218,6 +159,7 @@ size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset,
                 if (s->length < 16)
                     s->state = 9;
                 else {
+                    s->header_length = 16;
                     s->state = 8;
                 }
             }
@@ -240,10 +182,7 @@ size_t mp4_parse_atom(struct qtatom *s, const unsigned char *buf, size_t offset,
 size_t mp4_parse_unknown(struct mp4_state *s, struct unknown *unknown, const unsigned char *buf, size_t offset, size_t max, int is_final)
 {
     if (s->inner_state == 0) {
-        printf("0x%08x 0x%08x \"%s\" ", 
-                    (unsigned)s->atom.file_offset,
-                    (unsigned)s->atom.length,
-                    name_from_type(s->atom.type));
+        qtatom_debug_prolog(&s->atom);
     }
 
     while (offset < max) {
@@ -260,15 +199,17 @@ size_t mp4_parse_unknown(struct mp4_state *s, struct unknown *unknown, const uns
         }
     }
 
-    if (is_final)
-        printf("\n");
+    if (is_final) {
+        qtatom_debug_epilog(&s->atom);
+    }
     return offset;
 }
+
 
 /**
  * This parses the first-level of the file.
  */
-void mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, size_t max)
+size_t mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, size_t max)
 {
     
     while (offset < max) {
@@ -296,6 +237,23 @@ void mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, siz
         case Type_ftyp:
             mp4_parse_ftyp(s, &s->ftyp, buf, offset, offset + sub_length, is_final);
             break;
+        case Type_mvhd:
+            mp4_parse_mvhd(s, &s->mvhd, buf, offset, offset + sub_length, is_final);
+            break;
+        case Type_hdlr:
+            mp4_parse_hdlr(s, &s->hdlr, buf, offset, offset + sub_length, is_final);
+            break;
+        case Type_keys:
+            mp4_parse_keys(s, &s->keys, buf, offset, offset + sub_length, is_final);
+            break;
+        case Type_ilst:
+            mp4_parse_ilst(s, &s->ilst, buf, offset, offset + sub_length, is_final);
+            break;
+        case Type_moov:
+        case Type_trak:
+        case Type_meta:
+            mp4_parse_container(s, &s->container, buf, offset, offset + sub_length, is_final);
+            break;
         }
         offset += sub_length;
         s->atom.remaining -= sub_length;
@@ -309,6 +267,7 @@ void mp4_parse(struct mp4_state *s, const unsigned char *buf, size_t offset, siz
         s->atom.state = 0;
         s->inner_state = 0;
     }
+    return offset;
 }
 
 
@@ -339,6 +298,8 @@ int parse_file(const char *filename)
     printf("total = %llu\n", (unsigned long long)total_read);
 
     fclose(fp);
+
+    return 0;
 }
 
 int main(int argc, char *argv[])
